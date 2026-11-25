@@ -1,0 +1,1720 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronDown, Crown, Globe2, UserRound } from 'lucide-react';
+import { ActionModals, type ActiveModalType, type UserAccount } from './components/ActionModals';
+import { AmbientBackground } from './components/AmbientBackground';
+import { DiscoveryPortraitCard } from './components/DiscoveryPortraitCard';
+import { FloatingRoomActivity } from './components/FloatingRoomActivity';
+import { LiveLoungesModal } from './components/LiveLoungesModal';
+import { MemberAvatar } from './components/MemberAvatar';
+import { MessengerWidget } from './components/MessengerWidget';
+import { RightColumnCards } from './components/RightColumnCards';
+import {
+  ALL_COUNTRIES,
+  ALL_DISCOVERY_PROFILES,
+  DISCOVERY_PROFILES,
+  GLOBAL_LOUNGE_MEMBERS,
+  LIVE_LOUNGES,
+  LIVE_REVIEWS,
+  NATURAL_DM_GREETINGS,
+  TOPIC_DISCUSSION_LINES,
+} from './data/honeyData';
+import type {
+  ChatThread,
+  DeckFilter,
+  LiveReview,
+  LoungeMember,
+  LoungeMessage,
+  LoungeRoom,
+  PremiumStatus,
+  Profile,
+  RoomActivityPopup,
+} from './types/honey';
+
+const ACCOUNTS_STORAGE_KEY = 'honey_chat_accounts_v1';
+const SESSION_STORAGE_KEY = 'honey_chat_session_v1';
+
+function shuffleArray<T>(items: T[]): T[] {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function createNonRepeatingDeck(profiles: Profile[], excludeId?: string): Profile[] {
+  if (profiles.length === 0) return [];
+  const shuffled = shuffleArray(profiles);
+  if (excludeId && shuffled.length > 1 && shuffled[0].id === excludeId) {
+    const swapIdx = 1 + Math.floor(Math.random() * (shuffled.length - 1));
+    [shuffled[0], shuffled[swapIdx]] = [shuffled[swapIdx], shuffled[0]];
+  }
+  return shuffled;
+}
+
+function formatNowTime(): string {
+  const now = new Date();
+  return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function pickRandom<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+export default function App() {
+  // Discovery Deck State (Random/Girls/Boys + Global Country Picker)
+  const [deckFilter, setDeckFilter] = useState<DeckFilter>('all');
+  const [selectedCountry, setSelectedCountry] = useState<string>('All Countries');
+  const [isCountryMenuOpen, setIsCountryMenuOpen] = useState(false);
+  const countryDropdownRef = useRef<HTMLDivElement | null>(null);
+
+  const filteredProfiles = useMemo(() => {
+    const basePool =
+      selectedCountry === 'All Countries'
+        ? DISCOVERY_PROFILES
+        : ALL_DISCOVERY_PROFILES.filter((p) => p.country === selectedCountry);
+
+    const genderFiltered =
+      deckFilter === 'all' ? basePool : basePool.filter((p) => p.gender === deckFilter);
+
+    // If a specific country only has one gender, fall back gracefully to that country's members
+    if (genderFiltered.length > 0) return genderFiltered;
+    if (basePool.length > 0) return basePool;
+    return DISCOVERY_PROFILES;
+  }, [deckFilter, selectedCountry]);
+
+  const [deckQueue, setDeckQueue] = useState<Profile[]>(() =>
+    createNonRepeatingDeck(DISCOVERY_PROFILES)
+  );
+  const [slideDirection, setSlideDirection] = useState<1 | -1>(1);
+  const [isCardPaused, setIsCardPaused] = useState(false);
+  const [sparkFeedback, setSparkFeedback] = useState<string | null>(null);
+  const [favourites, setFavourites] = useState<Profile[]>([]);
+  const [reviews, setReviews] = useState<LiveReview[]>(LIVE_REVIEWS);
+
+  const adLinkRef = useRef<HTMLAnchorElement | null>(null);
+
+  // Auth & Accounts state (persisted in localStorage)
+  const [registeredAccounts, setRegisteredAccounts] = useState<UserAccount[]>(() => {
+    try {
+      const raw = window.localStorage.getItem(ACCOUNTS_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as UserAccount[]) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [userAccount, setUserAccount] = useState<UserAccount | null>(() => {
+    try {
+      const raw = window.localStorage.getItem(SESSION_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as UserAccount) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  // Premium Payment & Per-Member Free 5-Message Counter State
+  const [premiumStatus, setPremiumStatus] = useState<PremiumStatus>('none');
+  const [submittedTxId, setSubmittedTxId] = useState<string | null>(null);
+  const [freeMessagesByMember, setFreeMessagesByMember] = useState<Record<string, number>>({});
+  const [activeModal, setActiveModal] = useState<ActiveModalType>(null);
+
+  const premiumStatusRef = useRef<PremiumStatus>(premiumStatus);
+  const userAccountRef = useRef<UserAccount | null>(userAccount);
+  const activeModalRef = useRef<ActiveModalType>(activeModal);
+  useEffect(() => {
+    premiumStatusRef.current = premiumStatus;
+  }, [premiumStatus]);
+  useEffect(() => {
+    userAccountRef.current = userAccount;
+  }, [userAccount]);
+  useEffect(() => {
+    activeModalRef.current = activeModal;
+  }, [activeModal]);
+
+  // Global Adsterra click handler: ONLY runs after user has created/logged into an account, never while in Create Account modal or when Premium is active
+  useEffect(() => {
+    const handleGlobalAdClick = (e: MouseEvent) => {
+      if (!e.isTrusted) return;
+      if (!userAccountRef.current) return;
+      if (activeModalRef.current?.type === 'create-account') return;
+      if (premiumStatusRef.current === 'active') return;
+      const target = e.target as HTMLElement | null;
+      if (!adLinkRef.current) return;
+      if (target === adLinkRef.current || adLinkRef.current.contains(target)) return;
+      if (
+        target?.closest('[data-no-ad="true"]') ||
+        target?.closest('label') ||
+        (target instanceof HTMLInputElement && target.type === 'file')
+      ) {
+        return;
+      }
+      adLinkRef.current.click();
+    };
+    document.addEventListener('click', handleGlobalAdClick, true);
+    return () => document.removeEventListener('click', handleGlobalAdClick, true);
+  }, []);
+
+  const requireAccount = useCallback(() => {
+    if (!userAccount) {
+      setActiveModal({
+        type: 'create-account',
+        reason: 'Please create an account or log in first to unlock Honey Chat.',
+      });
+      return false;
+    }
+    return true;
+  }, [userAccount]);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        countryDropdownRef.current &&
+        !countryDropdownRef.current.contains(e.target as Node)
+      ) {
+        setIsCountryMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const currentProfile = deckQueue[0] ?? filteredProfiles[0] ?? DISCOVERY_PROFILES[0];
+
+  const handleChangeDeckFilter = useCallback(
+    (nextFilter: DeckFilter) => {
+      if (!requireAccount()) return;
+      setDeckFilter(nextFilter);
+      const basePool =
+        selectedCountry === 'All Countries'
+          ? DISCOVERY_PROFILES
+          : ALL_DISCOVERY_PROFILES.filter((p) => p.country === selectedCountry);
+      const nextFiltered =
+        nextFilter === 'all' ? basePool : basePool.filter((p) => p.gender === nextFilter);
+      setSlideDirection(1);
+      setDeckQueue(
+        createNonRepeatingDeck(nextFiltered.length > 0 ? nextFiltered : basePool)
+      );
+    },
+    [requireAccount, selectedCountry]
+  );
+
+  const handleSelectCountry = useCallback(
+    (country: string) => {
+      if (!requireAccount()) return;
+      setSelectedCountry(country);
+      setIsCountryMenuOpen(false);
+      const basePool =
+        country === 'All Countries'
+          ? DISCOVERY_PROFILES
+          : ALL_DISCOVERY_PROFILES.filter((p) => p.country === country);
+      const nextFiltered =
+        deckFilter === 'all' ? basePool : basePool.filter((p) => p.gender === deckFilter);
+      setSlideDirection(1);
+      setDeckQueue(
+        createNonRepeatingDeck(nextFiltered.length > 0 ? nextFiltered : basePool)
+      );
+    },
+    [deckFilter, requireAccount]
+  );
+
+  const advanceDeck = useCallback(
+    (direction: 1 | -1 = 1) => {
+      setSlideDirection(direction);
+      setDeckQueue((prev) => {
+        if (prev.length > 1) {
+          return prev.slice(1);
+        }
+        return createNonRepeatingDeck(filteredProfiles, prev[0]?.id);
+      });
+    },
+    [filteredProfiles]
+  );
+
+  const handleManualPass = useCallback(() => {
+    if (!requireAccount()) return;
+    advanceDeck(-1);
+  }, [requireAccount, advanceDeck]);
+
+  const handleManualNext = useCallback(() => {
+    if (!requireAccount()) return;
+    advanceDeck(1);
+  }, [requireAccount, advanceDeck]);
+
+  // Auto-advance every 8 seconds unless paused by hover/press
+  useEffect(() => {
+    if (isCardPaused) return;
+    const timer = window.setInterval(() => {
+      advanceDeck(1);
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [isCardPaused, advanceDeck, currentProfile.id]);
+
+  // Live Lounges State (10 global rooms with topic-driven group conversations)
+  const [lounges, setLounges] = useState<LoungeRoom[]>(LIVE_LOUNGES);
+  const [isLoungesModalOpen, setIsLoungesModalOpen] = useState(false);
+  const [activeLoungeId, setActiveLoungeId] = useState<string>(LIVE_LOUNGES[0].id);
+
+  // Seed initial live topic-focused group discussions across all 10 lounges (fresh live timestamps, no 1m/2m stale pills)
+  const [loungeMessagesByRoom, setLoungeMessagesByRoom] = useState<
+    Record<string, LoungeMessage[]>
+  >(() => {
+    const initial: Record<string, LoungeMessage[]> = {};
+    const nowTime = formatNowTime();
+    LIVE_LOUNGES.forEach((room, roomIdx) => {
+      const m1 = GLOBAL_LOUNGE_MEMBERS[roomIdx % GLOBAL_LOUNGE_MEMBERS.length];
+      const m2 = GLOBAL_LOUNGE_MEMBERS[(roomIdx + 5) % GLOBAL_LOUNGE_MEMBERS.length];
+      const m3 = GLOBAL_LOUNGE_MEMBERS[(roomIdx + 11) % GLOBAL_LOUNGE_MEMBERS.length];
+      const topicLines = TOPIC_DISCUSSION_LINES[room.id] ?? [
+        `Loving tonight’s vibe in ${room.name}—what keeps everyone awake at this hour?`,
+      ];
+      initial[room.id] = [
+        {
+          id: `init-sms-${room.id}-1`,
+          roomId: room.id,
+          type: 'sms',
+          memberId: m1.memberId,
+          memberName: m1.name,
+          username: m1.username,
+          gender: m1.gender,
+          avatarUrl: m1.avatarUrl,
+          city: m1.city,
+          country: m1.country,
+          nativeLanguage: m1.nativeLanguage,
+          isOnline: m1.isOnline,
+          text: topicLines[0] ?? m1.flirtyPromptLine,
+          timestamp: nowTime,
+        },
+        {
+          id: `init-sms-${room.id}-2`,
+          roomId: room.id,
+          type: 'sms',
+          memberId: m2.memberId,
+          memberName: m2.name,
+          username: m2.username,
+          gender: m2.gender,
+          avatarUrl: m2.avatarUrl,
+          city: m2.city,
+          country: m2.country,
+          nativeLanguage: m2.nativeLanguage,
+          isOnline: m2.isOnline,
+          text: topicLines[1] ?? topicLines[0],
+          timestamp: nowTime,
+        },
+        {
+          id: `init-sms-${room.id}-3`,
+          roomId: room.id,
+          type: 'sms',
+          memberId: m3.memberId,
+          memberName: m3.name,
+          username: m3.username,
+          gender: m3.gender,
+          avatarUrl: m3.avatarUrl,
+          city: m3.city,
+          country: m3.country,
+          nativeLanguage: m3.nativeLanguage,
+          isOnline: m3.isOnline,
+          text: topicLines[2] ?? topicLines[0],
+          timestamp: nowTime,
+        },
+      ];
+    });
+    return initial;
+  });
+
+  const loungesRef = useRef(lounges);
+  const loungeMessagesRef = useRef(loungeMessagesByRoom);
+  const isLoungesModalOpenRef = useRef(isLoungesModalOpen);
+  const activeLoungeIdRef = useRef(activeLoungeId);
+  useEffect(() => {
+    loungesRef.current = lounges;
+  }, [lounges]);
+  useEffect(() => {
+    loungeMessagesRef.current = loungeMessagesByRoom;
+  }, [loungeMessagesByRoom]);
+  useEffect(() => {
+    isLoungesModalOpenRef.current = isLoungesModalOpen;
+  }, [isLoungesModalOpen]);
+  useEffect(() => {
+    activeLoungeIdRef.current = activeLoungeId;
+  }, [activeLoungeId]);
+
+  // Floating Room Activity Popups (5-6 standalone popups in left column)
+  const [roomActivities, setRoomActivities] = useState<RoomActivityPopup[]>(() => {
+    const stamps = ['just now', '12s ago', '28s ago', '46s ago', '1m ago', '2m ago'];
+    return Array.from({ length: 6 }, (_, i) => {
+      const member = GLOBAL_LOUNGE_MEMBERS[(i * 3) % GLOBAL_LOUNGE_MEMBERS.length];
+      const room = LIVE_LOUNGES[(i * 2) % LIVE_LOUNGES.length];
+      return {
+        id: `act-init-${i}`,
+        memberName: member.name,
+        memberId: member.memberId,
+        avatarUrl: member.avatarUrl,
+        city: member.city,
+        country: member.country,
+        roomId: room.id,
+        roomName: room.name,
+        timestamp: stamps[i],
+      };
+    });
+  });
+
+  // Periodically push floating room-join notifications & increment room participant count (keeps lounge chat clean of join spam)
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const member = pickRandom(GLOBAL_LOUNGE_MEMBERS);
+      const room = pickRandom(LIVE_LOUNGES);
+
+      setLounges((prev) =>
+        prev.map((r) =>
+          r.id === room.id ? { ...r, participantCount: r.participantCount + 1 } : r
+        )
+      );
+
+      setRoomActivities((prev) => {
+        const nextItem: RoomActivityPopup = {
+          id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          memberName: member.name,
+          memberId: member.memberId,
+          avatarUrl: member.avatarUrl,
+          city: member.city,
+          country: member.country,
+          roomId: room.id,
+          roomName: room.name,
+          timestamp: 'just now',
+        };
+        const aged = prev.slice(0, 5).map((item, idx) => ({
+          ...item,
+          timestamp:
+            idx === 0
+              ? '10s ago'
+              : idx === 1
+                ? '26s ago'
+                : idx === 2
+                  ? '49s ago'
+                  : idx === 3
+                    ? '1m ago'
+                    : '2m ago',
+        }));
+        return [nextItem, ...aged];
+      });
+    }, 11000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // Unlimited live topic discussion stream inside Live Lounges at random 10–20 second intervals (never cancelled by participant count updates)
+  useEffect(() => {
+    let timerId = 0;
+    let cancelled = false;
+
+    const pushLoungeTopicMessage = async () => {
+      if (cancelled) return;
+
+      const allRooms = loungesRef.current;
+      const modalOpen = isLoungesModalOpenRef.current;
+      const targetRoom = modalOpen
+        ? allRooms.find((r) => r.id === activeLoungeIdRef.current) ?? pickRandom(allRooms)
+        : pickRandom(allRooms);
+
+      const currentRoomMsgs = (loungeMessagesRef.current[targetRoom.id] ?? []).filter(
+        (m) => m.type === 'sms'
+      );
+      const lastSpeakerId = currentRoomMsgs[currentRoomMsgs.length - 1]?.memberId;
+      const memberPool = GLOBAL_LOUNGE_MEMBERS.filter((m) => m.memberId !== lastSpeakerId);
+      const member = pickRandom(memberPool.length > 0 ? memberPool : GLOBAL_LOUNGE_MEMBERS);
+      const recentTexts = new Set(currentRoomMsgs.slice(-6).map((m) => m.text));
+      const pool = (TOPIC_DISCUSSION_LINES[targetRoom.id] ?? []).filter(
+        (line) => !recentTexts.has(line)
+      );
+      let smsText =
+        pool.length > 0
+          ? pickRandom(pool)
+          : pickRandom(
+              TOPIC_DISCUSSION_LINES[targetRoom.id] ?? [
+                `Loving tonight’s discussion here in ${targetRoom.name}.`,
+              ]
+            );
+
+      if (modalOpen) {
+        try {
+          const res = await fetch('/api/lounge-reply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              roomName: targetRoom.name,
+              roomCity: targetRoom.city,
+              roomCountry: targetRoom.country,
+              roomLanguage: targetRoom.language,
+              roomTopic: targetRoom.topic,
+              responderName: member.name,
+              responderId: member.memberId,
+              responderCountry: member.country,
+              responderCity: member.city,
+              responderLanguage: member.nativeLanguage,
+              recentMessages: currentRoomMsgs.slice(-6).map((m) => ({
+                memberName: m.memberName,
+                text: m.text,
+                isOwn: m.isOwn,
+              })),
+            }),
+          });
+          const data = (await res.json()) as { reply?: string };
+          if (res.ok && data.reply && !recentTexts.has(data.reply)) {
+            smsText = data.reply;
+          }
+        } catch {
+          // keep fresh topic fallback
+        }
+      }
+
+      if (cancelled) return;
+
+      const newMsg: LoungeMessage = {
+        id: `lounge-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        roomId: targetRoom.id,
+        type: 'sms',
+        memberId: member.memberId,
+        memberName: member.name,
+        username: member.username,
+        gender: member.gender,
+        avatarUrl: member.avatarUrl,
+        city: member.city,
+        country: member.country,
+        nativeLanguage: member.nativeLanguage,
+        isOnline: member.isOnline,
+        text: smsText,
+        timestamp: formatNowTime(),
+      };
+
+      setLoungeMessagesByRoom((prev) => {
+        const list = prev[targetRoom.id] ?? [];
+        return {
+          ...prev,
+          [targetRoom.id]: [...list, newMsg],
+        };
+      });
+    };
+
+    const scheduleNextLoungeMessage = () => {
+      const randomDelayMs = isLoungesModalOpenRef.current
+        ? 6000 + Math.floor(Math.random() * 6001) // brisk 6–12s live stream while inside lounge
+        : 10000 + Math.floor(Math.random() * 10001); // 10–20s background stream
+      timerId = window.setTimeout(async () => {
+        await pushLoungeTopicMessage();
+        if (!cancelled) scheduleNextLoungeMessage();
+      }, randomDelayMs);
+    };
+
+    scheduleNextLoungeMessage();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timerId);
+    };
+  }, []);
+
+function createStarterThreads(): ChatThread[] {
+  return [
+    {
+      memberId: DISCOVERY_PROFILES[0].memberId,
+      name: DISCOVERY_PROFILES[0].name,
+      username: DISCOVERY_PROFILES[0].username,
+      gender: DISCOVERY_PROFILES[0].gender,
+      avatarUrl: DISCOVERY_PROFILES[0].portraitUrl,
+      country: DISCOVERY_PROFILES[0].country,
+      city: DISCOVERY_PROFILES[0].city,
+      nativeLanguage: DISCOVERY_PROFILES[0].nativeLanguage,
+      bio: DISCOVERY_PROFILES[0].bio,
+      flirtyPromptLine: DISCOVERY_PROFILES[0].flirtyPromptLine,
+      isOnline: true,
+      isSpark: true,
+      unreadCount: 1,
+      lastActiveText: 'Active now',
+      messages: [
+        {
+          id: 'seed-1',
+          sender: 'them',
+          text: NATURAL_DM_GREETINGS[0],
+          timestamp: 'just now',
+        },
+      ],
+    },
+    {
+      memberId: DISCOVERY_PROFILES[1].memberId,
+      name: DISCOVERY_PROFILES[1].name,
+      username: DISCOVERY_PROFILES[1].username,
+      gender: DISCOVERY_PROFILES[1].gender,
+      avatarUrl: DISCOVERY_PROFILES[1].portraitUrl,
+      country: DISCOVERY_PROFILES[1].country,
+      city: DISCOVERY_PROFILES[1].city,
+      nativeLanguage: DISCOVERY_PROFILES[1].nativeLanguage,
+      bio: DISCOVERY_PROFILES[1].bio,
+      flirtyPromptLine: DISCOVERY_PROFILES[1].flirtyPromptLine,
+      isOnline: true,
+      isSpark: true,
+      unreadCount: 1,
+      lastActiveText: 'Active now',
+      messages: [
+        {
+          id: 'seed-2',
+          sender: 'them',
+          text: NATURAL_DM_GREETINGS[1],
+          timestamp: '1m ago',
+        },
+      ],
+    },
+    {
+      memberId: DISCOVERY_PROFILES[3].memberId,
+      name: DISCOVERY_PROFILES[3].name,
+      username: DISCOVERY_PROFILES[3].username,
+      gender: DISCOVERY_PROFILES[3].gender,
+      avatarUrl: DISCOVERY_PROFILES[3].portraitUrl,
+      country: DISCOVERY_PROFILES[3].country,
+      city: DISCOVERY_PROFILES[3].city,
+      nativeLanguage: DISCOVERY_PROFILES[3].nativeLanguage,
+      bio: DISCOVERY_PROFILES[3].bio,
+      flirtyPromptLine: DISCOVERY_PROFILES[3].flirtyPromptLine,
+      isOnline: false,
+      unreadCount: 0,
+      lastActiveText: '18m ago',
+      messages: [
+        {
+          id: 'seed-3',
+          sender: 'them',
+          text: NATURAL_DM_GREETINGS[2],
+          timestamp: '18m ago',
+        },
+      ],
+    },
+    {
+      memberId: 'HC-GRP1',
+      name: 'Midnight Velvet Circle',
+      username: 'midnight.velvet',
+      gender: 'woman',
+      avatarUrl: DISCOVERY_PROFILES[4].portraitUrl,
+      country: 'Global',
+      city: 'Paris · Seoul',
+      nativeLanguage: 'Multilingual',
+      bio: 'Curated group salon for multilingual night owls.',
+      flirtyPromptLine: 'Welcome to the Midnight Velvet Circle.',
+      isOnline: true,
+      isGroup: true,
+      unreadCount: 0,
+      lastActiveText: 'Active now',
+      messages: [
+        {
+          id: 'seed-grp',
+          sender: 'them',
+          text: `Ji-yeon: ${NATURAL_DM_GREETINGS[3]}`,
+          timestamp: '11m ago',
+        },
+      ],
+    },
+  ];
+}
+
+// Messenger State: Only populated & active after the user creates/logs into an account
+const [threads, setThreads] = useState<ChatThread[]>(() =>
+  userAccount ? createStarterThreads() : []
+);
+
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [isChatMinimized, setIsChatMinimized] = useState(false);
+  const [isInboxOpen, setIsInboxOpen] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+
+  const activeChatIdRef = useRef<string | null>(null);
+  const isChatMinimizedRef = useRef<boolean>(false);
+  const threadsRef = useRef<ChatThread[]>(threads);
+  const pendingTimeoutsRef = useRef<number[]>([]);
+
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+    isChatMinimizedRef.current = isChatMinimized;
+  }, [activeChatId, isChatMinimized]);
+  useEffect(() => {
+    threadsRef.current = threads;
+  }, [threads]);
+
+  // Clean up any scheduled timers on unmount
+  useEffect(() => {
+    return () => {
+      pendingTimeoutsRef.current.forEach((id) => window.clearTimeout(id));
+    };
+  }, []);
+
+  // Controlled Messenger arrivals: ONLY run while signed into an account (never before Sign Up or after Log Out)
+  const isSignedIn = Boolean(userAccount);
+  useEffect(() => {
+    if (!isSignedIn) return;
+
+    let timerId = 0;
+    let cancelled = false;
+
+    const scheduleNextDmArrival = () => {
+      const delayMs = 60000 + Math.floor(Math.random() * 60001); // random 1 to 2 minutes
+      timerId = window.setTimeout(() => {
+        if (cancelled) return;
+
+        const candidates = GLOBAL_LOUNGE_MEMBERS.filter((m) => {
+          const isCurrentlyOpen =
+            activeChatIdRef.current === m.memberId && !isChatMinimizedRef.current;
+          const thread = threadsRef.current.find((t) => t.memberId === m.memberId);
+          const lastMsg = thread?.messages[thread.messages.length - 1];
+          const alreadyHasUnrepliedGreeting = Boolean(thread && lastMsg && lastMsg.sender === 'them');
+          return !isCurrentlyOpen && !thread?.blockedUntilPremium && !alreadyHasUnrepliedGreeting;
+        });
+
+        if (candidates.length > 0) {
+          const sender = pickRandom(candidates);
+          const usedGreetings = new Set(
+            threadsRef.current
+              .slice(0, 8)
+              .map((t) => t.messages[t.messages.length - 1]?.text)
+              .filter(Boolean)
+          );
+          const availableGreetings = NATURAL_DM_GREETINGS.filter((g) => !usedGreetings.has(g));
+          const text =
+            availableGreetings.length > 0
+              ? pickRandom(availableGreetings)
+              : pickRandom(NATURAL_DM_GREETINGS);
+          const stamp = formatNowTime();
+
+          setThreads((prev) => {
+            const existingIdx = prev.findIndex((t) => t.memberId === sender.memberId);
+            const incomingMsg = {
+              id: `inc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              sender: 'them' as const,
+              text,
+              timestamp: stamp,
+            };
+
+            if (existingIdx >= 0) {
+              const existing = prev[existingIdx];
+              const updated: ChatThread = {
+                ...existing,
+                unreadCount: existing.unreadCount + 1,
+                dismissedHead: false,
+                messages: [...existing.messages, incomingMsg],
+              };
+              const rest = prev.filter((_, idx) => idx !== existingIdx);
+              return [updated, ...rest];
+            }
+
+            const created: ChatThread = {
+              memberId: sender.memberId,
+              name: sender.name,
+              username: sender.username,
+              gender: sender.gender,
+              avatarUrl: sender.avatarUrl,
+              country: sender.country,
+              city: sender.city,
+              nativeLanguage: sender.nativeLanguage,
+              bio: sender.bio,
+              flirtyPromptLine: sender.flirtyPromptLine,
+              isOnline: sender.isOnline,
+              unreadCount: 1,
+              lastActiveText: sender.isOnline ? 'Active now' : '12m ago',
+              messages: [incomingMsg],
+            };
+            return [created, ...prev];
+          });
+        }
+
+        scheduleNextDmArrival();
+      }, delayMs);
+    };
+
+    scheduleNextDmArrival();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timerId);
+    };
+  }, [isSignedIn]);
+
+  const openOrCreateThreadAndFocus = useCallback(
+    (
+      member: Pick<
+        LoungeMember,
+        | 'memberId'
+        | 'name'
+        | 'username'
+        | 'gender'
+        | 'city'
+        | 'country'
+        | 'nativeLanguage'
+        | 'avatarUrl'
+        | 'isOnline'
+        | 'bio'
+        | 'flirtyPromptLine'
+      >,
+      options?: { isSpark?: boolean }
+    ) => {
+      setChatError(null);
+      const prevList = threadsRef.current;
+      const existingIdx = prevList.findIndex((t) => t.memberId === member.memberId);
+      let nextList: ChatThread[];
+      if (existingIdx >= 0) {
+        const updated: ChatThread = {
+          ...prevList[existingIdx],
+          unreadCount: 0,
+          dismissedHead: false,
+          isSpark: options?.isSpark ? true : prevList[existingIdx].isSpark,
+        };
+        nextList = [...prevList];
+        nextList[existingIdx] = updated;
+      } else {
+        const usedGreetings = new Set(
+          prevList.slice(0, 6).map((t) => t.messages[t.messages.length - 1]?.text)
+        );
+        const freshGreetings = NATURAL_DM_GREETINGS.filter((g) => !usedGreetings.has(g));
+        const greetingText =
+          freshGreetings.length > 0
+            ? pickRandom(freshGreetings)
+            : pickRandom(NATURAL_DM_GREETINGS);
+
+        const created: ChatThread = {
+          memberId: member.memberId,
+          name: member.name,
+          username: member.username,
+          gender: member.gender,
+          avatarUrl: member.avatarUrl,
+          country: member.country,
+          city: member.city,
+          nativeLanguage: member.nativeLanguage,
+          bio: member.bio,
+          flirtyPromptLine: member.flirtyPromptLine,
+          isOnline: member.isOnline,
+          isSpark: Boolean(options?.isSpark),
+          unreadCount: 0,
+          lastActiveText: member.isOnline ? 'Active now' : '15m ago',
+          messages: [
+            {
+              id: `open-${Date.now()}`,
+              sender: 'them',
+              text: greetingText,
+              timestamp: formatNowTime(),
+            },
+          ],
+        };
+        nextList = [created, ...prevList];
+      }
+      threadsRef.current = nextList;
+      setThreads(nextList);
+      setActiveChatId(member.memberId);
+      setIsChatMinimized(false);
+      setIsInboxOpen(false);
+    },
+    []
+  );
+
+  const handleOpenChatById = useCallback(
+    (memberId: string) => {
+      if (!requireAccount()) return;
+      setChatError(null);
+      setThreads((prev) =>
+        prev.map((t) =>
+          t.memberId === memberId ? { ...t, unreadCount: 0, dismissedHead: false } : t
+        )
+      );
+      setActiveChatId(memberId);
+      setIsChatMinimized(false);
+      setIsInboxOpen(false);
+    },
+    [requireAccount]
+  );
+
+  const handleToggleFavourite = useCallback(
+    (profile: Profile) => {
+      if (!requireAccount()) return;
+      setFavourites((prev) => {
+        const exists = prev.some((p) => p.id === profile.id);
+        if (exists) {
+          return prev.filter((p) => p.id !== profile.id);
+        }
+        setSparkFeedback(`Saved ${profile.name} to Favourite`);
+        window.setTimeout(() => setSparkFeedback(null), 1800);
+        return [profile, ...prev];
+      });
+    },
+    [requireAccount]
+  );
+
+  const handleSuperSpark = useCallback(() => {
+    if (!requireAccount()) return;
+    const sparked = currentProfile;
+    setFavourites((prev) =>
+      prev.some((p) => p.id === sparked.id) ? prev : [sparked, ...prev]
+    );
+    setSparkFeedback(`Super Spark sent to ${sparked.name}`);
+    window.setTimeout(() => setSparkFeedback(null), 1800);
+    advanceDeck(1);
+  }, [requireAccount, currentProfile, advanceDeck]);
+
+  // Keyboard navigation for Left/Up/Right arrows on Discovery card
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (isLoungesModalOpen || activeModal) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        handleManualPass();
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        handleManualNext();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        handleSuperSpark();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isLoungesModalOpen, activeModal, handleManualPass, handleManualNext, handleSuperSpark]);
+
+  // Direct message handler:
+  // - Enforces 5 free SMS limit PER individual profile (other profiles stay open for SMS & calls)
+  // - Marks Seen at random 10-22s, shows "Typing...", and delivers short natural Gemini reply at 40-60s
+  const handleSendDirectMessage = useCallback(
+    async (memberId: string, text: string) => {
+      if (!requireAccount()) return;
+      setChatError(null);
+
+      const targetThread = threadsRef.current.find((t) => t.memberId === memberId);
+      if (!targetThread) return;
+
+      const sentToThisMember = freeMessagesByMember[memberId] ?? 0;
+
+      if (
+        premiumStatus !== 'active' &&
+        (targetThread.blockedUntilPremium || sentToThisMember >= 5)
+      ) {
+        setActiveModal({
+          type: 'unlock-premium',
+          reason: `You have used all 5 free messages with ${targetThread.name}. Unlock Honey Chat Premium ($15 USDT / month) to message or call ${targetThread.name} again—or chat with other members!`,
+        });
+        return;
+      }
+
+      const outgoingId = `me-${Date.now()}`;
+      const stamp = formatNowTime();
+
+      const updatedOutgoing = {
+        id: outgoingId,
+        sender: 'me' as const,
+        text,
+        timestamp: stamp,
+        seen: false,
+      };
+      const historySnapshot = [...targetThread.messages, updatedOutgoing].slice(-10);
+
+      let reachedLimitNow = false;
+      if (premiumStatus !== 'active') {
+        const nextCount = sentToThisMember + 1;
+        setFreeMessagesByMember((prev) => ({
+          ...prev,
+          [memberId]: nextCount,
+        }));
+        if (nextCount >= 5) {
+          reachedLimitNow = true;
+        }
+      }
+
+      setThreads((prev) =>
+        prev.map((t) =>
+          t.memberId === memberId
+            ? {
+                ...t,
+                unreadCount: 0,
+                blockedUntilPremium: reachedLimitNow ? true : t.blockedUntilPremium,
+                messages: [...t.messages, updatedOutgoing],
+              }
+            : t
+        )
+      );
+
+      // Random 40–60s natural human reply window: Seen at 10–22s -> Typing... -> Reply at 40–60s
+      const deliverDelayMs = 40000 + Math.floor(Math.random() * 20001);
+      const seenDelayMs = 10000 + Math.floor(Math.random() * 12001);
+      const typingDelayMs = seenDelayMs + 2000;
+
+      const seenTimer = window.setTimeout(() => {
+        setThreads((prev) =>
+          prev.map((t) =>
+            t.memberId === memberId
+              ? {
+                  ...t,
+                  messages: t.messages.map((m) =>
+                    m.id === outgoingId ? { ...m, seen: true } : m
+                  ),
+                }
+              : t
+          )
+        );
+      }, seenDelayMs);
+      pendingTimeoutsRef.current.push(seenTimer);
+
+      if (reachedLimitNow) {
+        const limitPromptTimer = window.setTimeout(() => {
+          setActiveModal({
+            type: 'unlock-premium',
+            reason: `You have sent 5 free messages to ${targetThread.name}. Unlock Honey Chat Premium ($15 USDT / month) to keep messaging & calling ${targetThread.name}—you can still chat with other members!`,
+          });
+        }, 700);
+        pendingTimeoutsRef.current.push(limitPromptTimer);
+      }
+
+      if (targetThread.blockedUntilPremium && premiumStatus !== 'active') {
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            memberName: targetThread.name,
+            memberId: targetThread.memberId,
+            country: targetThread.country,
+            city: targetThread.city,
+            nativeLanguage: targetThread.nativeLanguage,
+            bio: targetThread.bio,
+            flirtyPromptLine: targetThread.flirtyPromptLine,
+            userMessage: text,
+            history: historySnapshot.map((m) => ({
+              sender: m.sender,
+              text: m.text,
+            })),
+          }),
+        });
+
+        const data = (await res.json()) as {
+          reply?: string;
+          translation?: string;
+          error?: string;
+        };
+
+        if (!res.ok || !data.reply) {
+          throw new Error(data.error || 'Could not reach reply service right now.');
+        }
+
+        const typingTimer = window.setTimeout(() => {
+          setThreads((prev) =>
+            prev.map((t) =>
+              t.memberId === memberId ? { ...t, typing: true } : t
+            )
+          );
+        }, typingDelayMs);
+
+        const deliverTimer = window.setTimeout(() => {
+          const isActiveVisible =
+            activeChatIdRef.current === memberId && !isChatMinimizedRef.current;
+
+          setThreads((prev) =>
+            prev.map((t) => {
+              if (t.memberId !== memberId) return t;
+              return {
+                ...t,
+                typing: false,
+                unreadCount: isActiveVisible ? 0 : t.unreadCount + 1,
+                messages: [
+                  ...t.messages,
+                  {
+                    id: `ai-${Date.now()}`,
+                    sender: 'them',
+                    text: data.reply!,
+                    translation: data.translation || undefined,
+                    timestamp: formatNowTime(),
+                  },
+                ],
+              };
+            })
+          );
+        }, deliverDelayMs);
+
+        pendingTimeoutsRef.current.push(typingTimer, deliverTimer);
+      } catch (err: unknown) {
+        const rawErr = err instanceof Error ? err.message : '';
+        const friendlyErr =
+          rawErr && !rawErr.trim().startsWith('{')
+            ? rawErr
+            : 'Connection was briefly busy. Please send your message again.';
+        setChatError(friendlyErr);
+        setThreads((prev) =>
+          prev.map((t) => (t.memberId === memberId ? { ...t, typing: false } : t))
+        );
+      }
+    },
+    [requireAccount, premiumStatus, freeMessagesByMember]
+  );
+
+  // Non-premium 15-second voice/video call cutoff -> cuts call, sends sharp rejection SMS, and opens Unlock Premium
+  const handleNonPremiumCallCutoff = useCallback((memberId: string) => {
+    const isActiveVisible =
+      activeChatIdRef.current === memberId && !isChatMinimizedRef.current;
+
+    setThreads((prev) =>
+      prev.map((t) =>
+        t.memberId === memberId
+          ? {
+              ...t,
+              blockedUntilPremium: true,
+              typing: false,
+              dismissedHead: false,
+              unreadCount: isActiveVisible ? 0 : t.unreadCount + 1,
+              messages: [
+                ...t.messages,
+                {
+                  id: `cutoff-${Date.now()}`,
+                  sender: 'them',
+                  text: "You're so poor you can't even afford a simple Premium pass—what is there to even talk about with you? Buy Premium first.",
+                  timestamp: formatNowTime(),
+                },
+              ],
+            }
+          : t
+      )
+    );
+
+    setActiveModal({
+      type: 'unlock-premium',
+      reason:
+        'Your 15-second free call ended. Unlock Honey Chat Premium ($15 USDT / month) for unlimited audio/video calls, unlimited SMS, and an ad-free app!',
+    });
+  }, []);
+
+  // Post a live lounge message -> ~55% chance one member replies directly in 15-35s, ~45% chance members naturally skip & stay on topic
+  const handlePostLoungeMessage = useCallback(
+    async (roomId: string, text: string) => {
+      if (!requireAccount()) return;
+      const room = lounges.find((r) => r.id === roomId) ?? lounges[0];
+      const ownMsg: LoungeMessage = {
+        id: `own-${Date.now()}`,
+        roomId,
+        type: 'sms',
+        memberId: userAccount?.memberId ?? 'HC-YOU',
+        memberName: userAccount?.name ?? 'You',
+        username: userAccount?.username ?? 'guest',
+        gender: userAccount?.gender,
+        avatarUrl: userAccount?.avatarUrl,
+        city: userAccount?.city ?? 'Guest Suite',
+        country: userAccount?.country ?? 'Global',
+        nativeLanguage: userAccount?.nativeLanguage ?? 'Multilingual',
+        isOnline: true,
+        text,
+        timestamp: formatNowTime(),
+        isOwn: true,
+      };
+
+      setLoungeMessagesByRoom((prev) => ({
+        ...prev,
+        [roomId]: [...(prev[roomId] ?? []), ownMsg],
+      }));
+
+      // ~45% of the time members naturally skip replying directly and keep discussing their topic
+      const shouldReplyDirectly = Math.random() < 0.55;
+      if (!shouldReplyDirectly) {
+        return;
+      }
+
+      const replyDelayMs = 15000 + Math.floor(Math.random() * 20001); // 15-35s natural read + reply
+      const replyTimer = window.setTimeout(async () => {
+        const responder = pickRandom(GLOBAL_LOUNGE_MEMBERS);
+        const recentSnapshot = (loungeMessagesRef.current[roomId] ?? [])
+          .filter((m) => m.type === 'sms')
+          .slice(-8)
+          .map((m) => ({
+            memberName: m.memberName,
+            text: m.text,
+            isOwn: m.isOwn,
+          }));
+
+        try {
+          const res = await fetch('/api/lounge-reply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              roomName: room.name,
+              roomCity: room.city,
+              roomCountry: room.country,
+              roomLanguage: room.language,
+              roomTopic: room.topic,
+              responderName: responder.name,
+              responderId: responder.memberId,
+              responderCountry: responder.country,
+              responderCity: responder.city,
+              responderLanguage: responder.nativeLanguage,
+              userMessage: text,
+              recentMessages: recentSnapshot,
+            }),
+          });
+          const data = (await res.json()) as { reply?: string };
+          if (res.ok && data.reply) {
+            const replyMsg: LoungeMessage = {
+              id: `lounge-ai-${Date.now()}`,
+              roomId,
+              type: 'sms',
+              memberId: responder.memberId,
+              memberName: responder.name,
+              username: responder.username,
+              gender: responder.gender,
+              avatarUrl: responder.avatarUrl,
+              city: responder.city,
+              country: responder.country,
+              nativeLanguage: responder.nativeLanguage,
+              isOnline: responder.isOnline,
+              text: data.reply,
+              timestamp: formatNowTime(),
+            };
+            setLoungeMessagesByRoom((prev) => ({
+              ...prev,
+              [roomId]: [...(prev[roomId] ?? []), replyMsg],
+            }));
+          }
+        } catch {
+          // Silent fallback if network drops
+        }
+      }, replyDelayMs);
+
+      pendingTimeoutsRef.current.push(replyTimer);
+    },
+    [requireAccount, lounges, userAccount]
+  );
+
+  const handleAddOpinion = useCallback(
+    (opinionText: string) => {
+      if (!requireAccount()) return;
+      const nextReview: LiveReview = {
+        id: `rev-user-${Date.now()}`,
+        reviewerName: userAccount?.name ?? 'Guest Member',
+        memberId: userAccount?.memberId ?? 'HC-8842',
+        city: userAccount?.city ?? 'Global',
+        country: userAccount?.country ?? 'Lounge',
+        rating: 5,
+        comment: opinionText,
+        timestamp: 'just now',
+      };
+      setReviews((prev) => [nextReview, ...prev]);
+    },
+    [requireAccount, userAccount]
+  );
+
+  const joinedRoomsRef = useRef<Set<string>>(new Set());
+
+  const handleOpenLounges = useCallback(
+    (roomId?: string) => {
+      if (!requireAccount()) return;
+      if (roomId) {
+        setActiveLoungeId(roomId);
+        if (!joinedRoomsRef.current.has(roomId)) {
+          joinedRoomsRef.current.add(roomId);
+          setLounges((prev) =>
+            prev.map((r) =>
+              r.id === roomId ? { ...r, participantCount: r.participantCount + 1 } : r
+            )
+          );
+        }
+      }
+      setIsLoungesModalOpen(true);
+    },
+    [requireAccount]
+  );
+
+  const handleMessageProfile = useCallback(
+    (profile: Profile) => {
+      if (!requireAccount()) return;
+      openOrCreateThreadAndFocus({
+        memberId: profile.memberId,
+        name: profile.name,
+        username: profile.username,
+        gender: profile.gender,
+        city: profile.city,
+        country: profile.country,
+        nativeLanguage: profile.nativeLanguage,
+        avatarUrl: profile.portraitUrl,
+        isOnline: profile.isOnline,
+        bio: profile.bio,
+        flirtyPromptLine: profile.flirtyPromptLine,
+      });
+    },
+    [requireAccount, openOrCreateThreadAndFocus]
+  );
+
+  const handleSignUp = useCallback((account: UserAccount) => {
+    setRegisteredAccounts((prev) => {
+      const next = [account, ...prev];
+      try {
+        window.localStorage.setItem(ACCOUNTS_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // ignore storage quota errors
+      }
+      return next;
+    });
+    setUserAccount(account);
+    setThreads((prev) => (prev.length > 0 ? prev : createStarterThreads()));
+    try {
+      window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(account));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const handleLogin = useCallback((account: UserAccount) => {
+    setUserAccount(account);
+    setThreads((prev) => (prev.length > 0 ? prev : createStarterThreads()));
+    try {
+      window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(account));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    pendingTimeoutsRef.current.forEach((id) => window.clearTimeout(id));
+    pendingTimeoutsRef.current = [];
+    setUserAccount(null);
+    setActiveChatId(null);
+    setIsInboxOpen(false);
+    setIsChatMinimized(false);
+    setChatError(null);
+    setThreads([]);
+    try {
+      window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const handleUpdateAvatar = useCallback((avatarUrl?: string) => {
+    setUserAccount((prev) => {
+      if (!prev) return prev;
+      const updated = { ...prev, avatarUrl };
+      try {
+        window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(updated));
+      } catch {
+        // ignore
+      }
+      setRegisteredAccounts((list) => {
+        const nextList = list.map((a) =>
+          a.memberId === updated.memberId ? updated : a
+        );
+        try {
+          window.localStorage.setItem(ACCOUNTS_STORAGE_KEY, JSON.stringify(nextList));
+        } catch {
+          // ignore
+        }
+        return nextList;
+      });
+      return updated;
+    });
+  }, []);
+
+  const handleSubmitPremiumPayment = useCallback((txId: string, _amountText: string) => {
+    setSubmittedTxId(txId);
+    setPremiumStatus('pending');
+  }, []);
+
+  const isCurrentFavourite = favourites.some((p) => p.id === currentProfile.id);
+
+  return (
+    <div className="relative min-h-screen w-full text-white">
+      <a
+        ref={adLinkRef}
+        href="https://auctionr.org/4/44f1324a3594d458a62905ffae3a29e3"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="hidden"
+        aria-hidden="true"
+      />
+      <AmbientBackground />
+
+      {/* Top Navigation Bar */}
+      <header className="relative z-30 mx-auto flex max-w-[1380px] items-center justify-between gap-4 px-4 py-5 sm:px-8">
+        {/* Zone 1: Brand Wordmark */}
+        <a
+          href="#discover"
+          className="font-editorial text-2xl sm:text-3xl font-semibold tracking-tight text-white whitespace-nowrap shrink-0"
+        >
+          Honey <span className="animate-gold-pink-shimmer">Chat</span>
+        </a>
+
+        {/* Zone 2: Clean Single-Line Nav Links */}
+        <nav
+          aria-label="Primary navigation"
+          className="hidden xl:flex items-center gap-6 text-sm font-medium text-white/75"
+        >
+          <a
+            href="#discover"
+            onClick={(e) => {
+              if (!requireAccount()) e.preventDefault();
+            }}
+            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+          >
+            Discover
+          </a>
+          <button
+            type="button"
+            onClick={() => handleOpenLounges()}
+            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+          >
+            Live Lounges
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (!requireAccount()) return;
+              setActiveModal({ type: 'favourite' });
+            }}
+            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+          >
+            Favourite
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (!requireAccount()) return;
+              setActiveModal({ type: 'match-date', profile: currentProfile });
+            }}
+            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+          >
+            Match Date
+          </button>
+        </nav>
+
+        {/* Zone 3: Global Country Picker + Random/Girls/Boys + Unlock Premium + Enter Lounges + Create Account (Rightmost!) */}
+        <div className="flex items-center gap-2 shrink-0">
+          {/* Global Country Dropdown Button */}
+          <div className="relative" ref={countryDropdownRef}>
+            <button
+              type="button"
+              onClick={() => {
+                if (!requireAccount()) return;
+                setIsCountryMenuOpen((o) => !o);
+              }}
+              aria-expanded={isCountryMenuOpen}
+              aria-label="Select country"
+              className="glass-3d-button inline-flex items-center gap-1.5 rounded-full border-white/20 bg-white/[0.06] px-3 py-1.5 text-xs font-semibold text-white whitespace-nowrap shrink-0"
+            >
+              <Globe2 className="h-3.5 w-3.5 text-amber-300 shrink-0" aria-hidden="true" />
+              <span>
+                {selectedCountry === 'All Countries' ? 'Global' : selectedCountry}
+              </span>
+              <ChevronDown className="h-3 w-3 text-white/65 shrink-0" aria-hidden="true" />
+            </button>
+
+            {isCountryMenuOpen && (
+              <div className="honey-scroll absolute left-0 top-11 z-50 max-h-72 w-52 overflow-y-auto rounded-2xl border border-white/15 bg-[#120D1F]/95 p-1.5 backdrop-blur-2xl shadow-2xl">
+                <button
+                  type="button"
+                  onClick={() => handleSelectCountry('All Countries')}
+                  className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-xs font-medium transition-colors ${
+                    selectedCountry === 'All Countries'
+                      ? 'bg-gradient-to-r from-fuchsia-500/35 to-amber-500/30 text-white'
+                      : 'text-white/75 hover:bg-white/10 hover:text-white'
+                  }`}
+                >
+                  <span>All Countries (Global)</span>
+                </button>
+                {ALL_COUNTRIES.map((country) => (
+                  <button
+                    key={country}
+                    type="button"
+                    onClick={() => handleSelectCountry(country)}
+                    className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-xs font-medium transition-colors ${
+                      selectedCountry === country
+                        ? 'bg-gradient-to-r from-fuchsia-500/35 to-amber-500/30 text-white'
+                        : 'text-white/75 hover:bg-white/10 hover:text-white'
+                    }`}
+                  >
+                    <span>{country}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Random | Girls | Boys Selector */}
+          <div
+            className="hidden sm:flex items-center gap-0.5 rounded-full border border-white/15 bg-white/[0.06] p-1 backdrop-blur-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]"
+            role="group"
+            aria-label="Filter discovery stream"
+          >
+            {(
+              [
+                { id: 'all', label: 'Random' },
+                { id: 'woman', label: 'Girls' },
+                { id: 'man', label: 'Boys' },
+              ] as const
+            ).map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => handleChangeDeckFilter(opt.id)}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-all whitespace-nowrap shrink-0 ${
+                  deckFilter === opt.id
+                    ? 'bg-gradient-to-r from-fuchsia-500/80 via-rose-500/80 to-amber-500/80 text-white shadow-[0_4px_14px_rgba(244,114,182,0.35)]'
+                    : 'text-white/65 hover:text-white'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              if (!requireAccount()) return;
+              setActiveModal({ type: 'unlock-premium' });
+            }}
+            className={`glass-3d-button inline-flex items-center gap-1.5 rounded-full px-3.5 py-2 text-xs sm:text-sm font-semibold whitespace-nowrap shrink-0 ${
+              premiumStatus === 'active'
+                ? 'border-amber-300/65 bg-gradient-to-r from-amber-400/30 via-rose-500/25 to-amber-300/30 text-amber-100 shadow-[0_0_24px_rgba(251,191,36,0.35)]'
+                : 'border-amber-300/40 bg-gradient-to-r from-amber-500/20 via-rose-500/20 to-fuchsia-500/20 text-amber-200'
+            }`}
+          >
+            <Crown className="h-4 w-4 text-amber-300 shrink-0" aria-hidden="true" />
+            <span className="hidden lg:inline">
+              {premiumStatus === 'active'
+                ? 'Premium VIP'
+                : premiumStatus === 'pending'
+                  ? 'Pending Approval'
+                  : 'Unlock Premium'}
+            </span>
+          </button>
+
+          {/* Create Account / Signed-in User Profile moved to the very right */}
+          <button
+            type="button"
+            onClick={() => setActiveModal({ type: 'create-account' })}
+            aria-label={userAccount ? `Account: ${userAccount.name}` : 'Create Account'}
+            title={
+              userAccount
+                ? `${userAccount.name} (@${userAccount.username})`
+                : 'Create Account / Login'
+            }
+            className="glass-3d-button inline-flex items-center gap-2 rounded-full border-sky-300/35 bg-gradient-to-r from-indigo-500/25 via-fuchsia-500/20 to-sky-400/25 px-3 py-1.5 text-xs sm:text-sm font-semibold text-white whitespace-nowrap shrink-0"
+          >
+            {userAccount ? (
+              <>
+                <MemberAvatar
+                  name={userAccount.name}
+                  avatarUrl={userAccount.avatarUrl}
+                  sizeClass="h-6 w-6"
+                  textSizeClass="text-[9px]"
+                />
+                <div className="hidden md:flex flex-col items-start leading-tight text-left">
+                  <span className="text-xs font-semibold text-white">{userAccount.name}</span>
+                  <span className="font-mono-id text-[10px] text-fuchsia-200/85">
+                    @{userAccount.username}
+                  </span>
+                </div>
+              </>
+            ) : (
+              <>
+                <UserRound className="h-4 w-4 text-sky-300 shrink-0" aria-hidden="true" />
+                <span className="hidden md:inline">Create Account</span>
+              </>
+            )}
+          </button>
+        </div>
+      </header>
+
+      {/* Main Two-Column Discovery & Live Lounge Grid */}
+      <main
+        id="discover"
+        className="relative z-10 mx-auto grid max-w-[1380px] grid-cols-1 gap-7 px-4 pb-24 pt-1 sm:px-8 lg:grid-cols-12 lg:items-start lg:gap-8"
+      >
+        {/* Left Column: Global Discovery Portrait Card + Controls + Floating Room Activity Popups */}
+        <div className="flex flex-col gap-5 lg:col-span-5">
+          <DiscoveryPortraitCard
+            profile={currentProfile}
+            direction={slideDirection}
+            isPaused={isCardPaused}
+            onPauseChange={setIsCardPaused}
+            onPass={handleManualPass}
+            onSuperSpark={handleSuperSpark}
+            onNext={handleManualNext}
+            onMessage={handleMessageProfile}
+            isFavourite={isCurrentFavourite}
+            onToggleFavourite={handleToggleFavourite}
+            sparkFeedback={sparkFeedback}
+            onRequireAccount={requireAccount}
+          />
+
+          <FloatingRoomActivity
+            activities={roomActivities}
+            onJoinRoom={(roomId) => handleOpenLounges(roomId)}
+          />
+        </div>
+
+        {/* Right Column: Live Lounges (top) -> Action Grid -> Live Review / My Opinion in This App / Bio */}
+        <div className="lg:col-span-7">
+          <RightColumnCards
+            profile={currentProfile}
+            deckSize={filteredProfiles.length}
+            deckFilter={deckFilter}
+            onChangeDeckFilter={handleChangeDeckFilter}
+            reviews={reviews}
+            onSubmitOpinion={handleAddOpinion}
+            lounges={lounges}
+            favouriteCount={favourites.length}
+            onOpenMatchDate={() => {
+              if (!requireAccount()) return;
+              setActiveModal({ type: 'match-date', profile: currentProfile });
+            }}
+            onOpenFavourite={() => {
+              if (!requireAccount()) return;
+              setActiveModal({ type: 'favourite' });
+            }}
+            onOpenInviteNew={() => {
+              if (!requireAccount()) return;
+              setActiveModal({ type: 'invite-new' });
+            }}
+            onOpenLiveLounges={(roomId) => handleOpenLounges(roomId)}
+            onRequireAccount={requireAccount}
+          />
+        </div>
+      </main>
+
+      {/* Nonstop Global Live Lounges Modal */}
+      <LiveLoungesModal
+        isOpen={isLoungesModalOpen}
+        onClose={() => setIsLoungesModalOpen(false)}
+        lounges={lounges}
+        activeRoomId={activeLoungeId}
+        onSelectRoom={setActiveLoungeId}
+        messagesByRoom={loungeMessagesByRoom}
+        onPostMessage={handlePostLoungeMessage}
+        onStartDirectChat={(member) => {
+          if (!requireAccount()) return;
+          openOrCreateThreadAndFocus(member);
+          setIsLoungesModalOpen(false);
+        }}
+        allMembers={GLOBAL_LOUNGE_MEMBERS}
+      />
+
+      {/* Action Modals (Create Account/Login, Unlock Premium Binance Pay, Match Date, Favourite, Invite New, Voice/Video Call) */}
+      <ActionModals
+        modal={activeModal}
+        onClose={() => setActiveModal(null)}
+        onSwitchToPremium={(reason) => setActiveModal({ type: 'unlock-premium', reason })}
+        favourites={favourites}
+        onToggleFavourite={handleToggleFavourite}
+        onMessageProfile={handleMessageProfile}
+        onSendMatchDateInvite={(profile, inviteText) => {
+          handleMessageProfile(profile);
+          void handleSendDirectMessage(profile.memberId, inviteText);
+        }}
+        userAccount={userAccount}
+        registeredAccounts={registeredAccounts}
+        onSignUp={handleSignUp}
+        onLogin={handleLogin}
+        onLogout={handleLogout}
+        onUpdateAvatar={handleUpdateAvatar}
+        premiumStatus={premiumStatus}
+        submittedTxId={submittedTxId}
+        onSubmitPremiumPayment={handleSubmitPremiumPayment}
+        onNonPremiumCallCutoff={handleNonPremiumCallCutoff}
+      />
+
+      {/* Bottom-Right Messenger Widget (Fixed Dock, Stacked Chat Heads, Inbox, Floating Chat Popup) */}
+      <MessengerWidget
+        threads={threads}
+        activeChatId={activeChatId}
+        isChatMinimized={isChatMinimized}
+        isInboxOpen={isInboxOpen}
+        chatError={chatError}
+        isFreeMessageLimitReached={
+          premiumStatus !== 'active' &&
+          Boolean(
+            activeChatId &&
+              (threads.find((t) => t.memberId === activeChatId)?.blockedUntilPremium ||
+                (freeMessagesByMember[activeChatId] ?? 0) >= 5)
+          )
+        }
+        onUnlockPremium={() => {
+          const lockedName =
+            threads.find((t) => t.memberId === activeChatId)?.name ?? 'this member';
+          setActiveModal({
+            type: 'unlock-premium',
+            reason: `You have used all 5 free messages with ${lockedName}. Unlock Honey Chat Premium ($15 USDT / month) to keep messaging or calling ${lockedName}—other members stay open!`,
+          });
+        }}
+        onToggleInbox={() => {
+          if (!requireAccount()) return;
+          setIsInboxOpen((v) => !v);
+        }}
+        onCloseInbox={() => setIsInboxOpen(false)}
+        onOpenChat={handleOpenChatById}
+        onBackToInbox={() => {
+          setActiveChatId(null);
+          setIsInboxOpen(true);
+        }}
+        onCloseChat={() => setActiveChatId(null)}
+        onToggleMinimizeChat={() => setIsChatMinimized((v) => !v)}
+        onDismissChatHead={(memberId) =>
+          setThreads((prev) =>
+            prev.map((t) =>
+              t.memberId === memberId ? { ...t, dismissedHead: true } : t
+            )
+          )
+        }
+        onSendMessage={handleSendDirectMessage}
+        onStartVoiceCall={(thread) => {
+          if (!requireAccount()) return;
+          if (
+            premiumStatus !== 'active' &&
+            (thread.blockedUntilPremium || (freeMessagesByMember[thread.memberId] ?? 0) >= 5)
+          ) {
+            setActiveModal({
+              type: 'unlock-premium',
+              reason: `Buy Honey Chat Premium ($15 USDT / month) first to message or voice call ${thread.name} again. You can still message & call other members!`,
+            });
+            return;
+          }
+          setActiveModal({
+            type: 'call',
+            mode: 'voice',
+            name: thread.name,
+            username: thread.username,
+            gender: thread.gender,
+            memberId: thread.memberId,
+            city: thread.city,
+            country: thread.country,
+            nativeLanguage: thread.nativeLanguage,
+            bio: thread.bio,
+            avatarUrl: thread.avatarUrl,
+            greeting: thread.flirtyPromptLine,
+          });
+        }}
+        onStartVideoCall={(thread) => {
+          if (!requireAccount()) return;
+          setActiveModal({
+            type: 'call',
+            mode: 'video',
+            name: thread.name,
+            username: thread.username,
+            gender: thread.gender,
+            memberId: thread.memberId,
+            city: thread.city,
+            country: thread.country,
+            nativeLanguage: thread.nativeLanguage,
+            bio: thread.bio,
+            avatarUrl: thread.avatarUrl,
+            greeting: thread.flirtyPromptLine,
+          });
+        }}
+      />
+    </div>
+  );
+}

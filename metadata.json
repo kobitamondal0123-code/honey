@@ -1,0 +1,6 @@
+{
+  "name": "Honey Chat",
+  "description": "Global evening discovery deck, live multilingual lounges, and real-time voice and chat connections.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
